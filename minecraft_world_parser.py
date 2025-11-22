@@ -22,7 +22,7 @@ def spiral_chunks(max_radius):
 # ---------------------------
 # Load world
 # ---------------------------
-WORLD_PATH = r"path_to_your_save_file"
+WORLD_PATH = r"path_to_your_minecraft_save"
 dimension = "minecraft:overworld"
 
 print("INFO - Loading:", WORLD_PATH)
@@ -101,16 +101,32 @@ for chunk_x, chunk_z in spiral_chunks(MAX_RADIUS):
                         all_blocks.add(name)
 
             # ---------- biomes ----------
+            # dans ta boucle sur les subchunks
             if chunk.biomes.has_section(section_y):
                 biome_arr = chunk.biomes.get_section(section_y)
                 for bx in range(biome_arr.shape[0]):
                     for by in range(biome_arr.shape[1]):
                         for bz in range(biome_arr.shape[2]):
-                            bidx = biome_arr[bx, by, bz]
-                            biome = chunk.biome_palette[bidx]
-                            biome_counter[biome] += 1
+                            idx = biome_arr[bx, by, bz]
+                            universal_biome = chunk.biome_palette[idx]
+
+                            # ✅ traduction correcte
+                            real_biome = translator.biome.from_universal(universal_biome)
+
+                            # certains renvoient tuple → prendre premier
+                            if isinstance(real_biome, tuple):
+                                real_biome = real_biome[0]
+
+                            # fallback
+                            if real_biome is None:
+                                name = getattr(universal_biome, "namespaced_name", str(universal_biome))
+                            else:
+                                name = getattr(real_biome, "namespaced_name", str(real_biome))
+
+                            biome_counter[name] += 1
 
         dominant_biome = biome_counter.most_common(1)[0][0] if biome_counter else "unknown"
+
 
     chunk_data.append({
         "x": chunk_x,
@@ -123,7 +139,7 @@ for chunk_x, chunk_z in spiral_chunks(MAX_RADIUS):
 # ---------------------------
 # Write CSV
 # ---------------------------
-output_csv = "chunks_final.csv"
+output_csv = "chunks_save.csv"
 all_blocks = sorted(all_blocks)
 
 with open(output_csv, "w", newline="", encoding="utf-8") as f:
