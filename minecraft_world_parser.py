@@ -1,12 +1,11 @@
+#!/usr/bin/env python3
 import amulet
 from amulet.api.errors import ChunkLoadError, ChunkDoesNotExist
 from collections import Counter
 import numpy as np
 import csv
-import argparse
 from tqdm import tqdm
-import os
-import sys
+import argparse
 
 # ---------------------------
 # Spiral chunk iterator
@@ -22,26 +21,50 @@ def spiral_chunks(max_radius):
         z += dz
 
 # ---------------------------
-# Safe block/biome translation
+# Helpers: normalize key for a universal block/biome
 # ---------------------------
-def safe_block_name(block, translator):
-    real = translator.from_universal(block)
-    if isinstance(real, tuple):
-        real = real[0]
-    if real is None:
-        return getattr(block, "namespaced_name", str(block))
-    return getattr(real, "namespaced_name", str(real))
-
-def safe_biome_name(biome, translator):
-    real = translator.from_universal(biome)
-    if isinstance(real, tuple):
-        real = real[0]
-    if real is None:
-        return getattr(biome, "namespaced_name", str(biome))
-    return getattr(real, "namespaced_name", str(real))
+def universal_key(obj):
+    """Return a stable key (string) for a universal block/biome object."""
+    # prefer namespaced_name when present, otherwise fallback to str()
+    return getattr(obj, "namespaced_name", None) or str(obj)
 
 # ---------------------------
-# Main function
+# Dynamic caches (global for the run)
+# ---------------------------
+BLOCK_CACHE = {}  # universal_key -> translated_name
+BIOME_CACHE = {}  # universal_key -> translated_name
+
+def translate_block_from_palette(idx, palette, translator):
+    """
+    Given an index in a chunk.palette, translate via translator only when needed.
+    Caches by universal_key of the palette element (not by index).
+    """
+    uni = palette[idx]
+    key = universal_key(uni)
+    if key in BLOCK_CACHE:
+        return BLOCK_CACHE[key]
+    # translate and cache
+    real = translator.from_universal(uni)
+    if isinstance(real, tuple):
+        real = real[0]
+    name = getattr(real, "namespaced_name", None) or getattr(uni, "namespaced_name", None) or str(uni)
+    BLOCK_CACHE[key] = name
+    return name
+
+def translate_biome_from_palette(idx, palette, translator):
+    uni = palette[idx]
+    key = universal_key(uni)
+    if key in BIOME_CACHE:
+        return BIOME_CACHE[key]
+    real = translator.from_universal(uni)
+    if isinstance(real, tuple):
+        real = real[0]
+    name = getattr(real, "namespaced_name", None) or getattr(uni, "namespaced_name", None) or str(uni)
+    BIOME_CACHE[key] = name
+    return name
+
+# ---------------------------
+# Main
 # ---------------------------
 def main(world_path, output_csv, max_radius):
     dimension = "minecraft:overworld"
@@ -57,13 +80,14 @@ def main(world_path, output_csv, max_radius):
     block_translator = translator.block
     biome_translator = translator.biome
 
-    chunk_data = []
-    all_blocks = set()
-
     coords = list(spiral_chunks(max_radius))
     print(f"INFO - Total chunks to process: {len(coords)}")
 
-    # Iterate chunks with progress bar
+    empty_subchunk = np.zeros(16*16*16, dtype=int)  # reusable empty subchunk
+
+    chunk_data = []
+    all_blocks = set()
+
     for chunk_x, chunk_z in tqdm(coords, desc="Processing chunks", ncols=100):
         try:
             chunk = level.get_chunk(chunk_x, chunk_z, dimension)
@@ -78,36 +102,42 @@ def main(world_path, output_csv, max_radius):
             block_counter["minecraft:air"] = 16*16*384
             dominant_biome = "unknown"
         else:
-            for sy in range(min(subchunks), max(subchunks)+1):
+            # Collect flattened arrays for the present subchunks (reuse empty_subchunk when missing)
+            all_blocks_arr = []
+            all_biomes_arr = []
+
+            min_sy = min(subchunks)
+            max_sy = max(subchunks)
+            for sy in range(min_sy, max_sy + 1):
                 if sy in chunk.blocks.sub_chunks:
-                    arr = chunk.blocks.get_sub_chunk(sy)
+                    arr = chunk.blocks.get_sub_chunk(sy).flatten()
                 else:
-                    arr = np.zeros((16,16,16), dtype=int)
+                    arr = empty_subchunk
+                all_blocks_arr.append(arr)
+
+                if chunk.biomes.has_section(sy):
+                    b_arr = chunk.biomes.get_section(sy).flatten()
+                    all_biomes_arr.append(b_arr)
+
+            # Vectorized count for blocks (single np.unique per chunk)
+            if all_blocks_arr:
+                flat_blocks = np.concatenate(all_blocks_arr)
+                unique_idx, counts = np.unique(flat_blocks, return_counts=True)
+                # Translate only the universal palette entries we need (and cache by universal key)
                 palette = chunk.block_palette
-
-                # ---------- PRE-TRANSLATION ----------
-                translated_palette = {i: safe_block_name(b, block_translator) for i, b in enumerate(palette)}
-
-                # ---------- VECTORIZE COUNT ----------
-                flat_arr = arr.flatten()
-                unique, counts = np.unique(flat_arr, return_counts=True)
-                for idx, cnt in zip(unique, counts):
-                    name = translated_palette[idx]
-                    block_counter[name] += cnt
+                for idx, cnt in zip(unique_idx, counts):
+                    name = translate_block_from_palette(int(idx), palette, block_translator)
+                    block_counter[name] += int(cnt)
                     all_blocks.add(name)
 
-                # ---------- BIOMES ----------
-                if chunk.biomes.has_section(sy):
-                    biome_arr = chunk.biomes.get_section(sy)
-                    biome_palette = chunk.biome_palette
-                    # pre-translate biome palette
-                    translated_biome_palette = {i: safe_biome_name(b, biome_translator) for i, b in enumerate(biome_palette)}
-
-                    flat_biome = biome_arr.flatten()
-                    unique_b, counts_b = np.unique(flat_biome, return_counts=True)
-                    for idx, cnt in zip(unique_b, counts_b):
-                        name = translated_biome_palette[idx]
-                        biome_counter[name] += cnt
+            # Vectorized count for biomes (single np.unique per chunk)
+            if all_biomes_arr:
+                flat_biomes = np.concatenate(all_biomes_arr)
+                unique_b, counts_b = np.unique(flat_biomes, return_counts=True)
+                palette_b = chunk.biome_palette
+                for idx, cnt in zip(unique_b, counts_b):
+                    bname = translate_biome_from_palette(int(idx), palette_b, biome_translator)
+                    biome_counter[bname] += int(cnt)
 
             dominant_biome = biome_counter.most_common(1)[0][0] if biome_counter else "unknown"
 
@@ -120,23 +150,25 @@ def main(world_path, output_csv, max_radius):
 
     level.close()
 
-    # Write CSV
+    # Write CSV (one row per chunk, wide format)
     all_blocks = sorted(all_blocks)
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         header = ["chunk_x", "chunk_z", "dominant_biome"] + all_blocks
         writer.writerow(header)
         for entry in chunk_data:
-            row = [entry["x"], entry["z"], entry["biome"]] + [entry["blocks"].get(b,0) for b in all_blocks]
+            row = [entry["x"], entry["z"], entry["biome"]] + [entry["blocks"].get(b, 0) for b in all_blocks]
             writer.writerow(row)
 
     print(f"✔ DONE — CSV written: {output_csv}")
+    print(f"INFO - Unique universal block types translated: {len(BLOCK_CACHE)}")
+    print(f"INFO - Unique universal biome types translated: {len(BIOME_CACHE)}")
 
 # ---------------------------
 # CLI
 # ---------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Minecraft chunk CSV exporter (fast mono-process)")
+    parser = argparse.ArgumentParser(description="Minecraft chunk CSV exporter (dynamic-universal-cache + vectorized)")
     parser.add_argument("world", help="Path to Minecraft world folder")
     parser.add_argument("-o", "--output", default="chunks_biomes.csv", help="Output CSV filename")
     parser.add_argument("-r", "--radius", type=int, default=10, help="Radius of chunks to process (spiral)")
