@@ -1,9 +1,12 @@
 import amulet
 from amulet.api.errors import ChunkLoadError, ChunkDoesNotExist
 from collections import Counter
-import csv
 import numpy as np
-
+import csv
+import argparse
+from tqdm import tqdm
+import os
+import sys
 
 # ---------------------------
 # Spiral chunk iterator
@@ -18,142 +21,125 @@ def spiral_chunks(max_radius):
         x += dx
         z += dz
 
+# ---------------------------
+# Safe block/biome translation
+# ---------------------------
+def safe_block_name(block, translator):
+    real = translator.from_universal(block)
+    if isinstance(real, tuple):
+        real = real[0]
+    if real is None:
+        return getattr(block, "namespaced_name", str(block))
+    return getattr(real, "namespaced_name", str(real))
+
+def safe_biome_name(biome, translator):
+    real = translator.from_universal(biome)
+    if isinstance(real, tuple):
+        real = real[0]
+    if real is None:
+        return getattr(biome, "namespaced_name", str(biome))
+    return getattr(real, "namespaced_name", str(real))
 
 # ---------------------------
-# Load world
+# Main function
 # ---------------------------
-WORLD_PATH = r"path_to_your_minecraft_save"
-dimension = "minecraft:overworld"
+def main(world_path, output_csv, max_radius):
+    dimension = "minecraft:overworld"
 
-print("INFO - Loading:", WORLD_PATH)
-level = amulet.load_level(WORLD_PATH)
+    print(f"INFO - Loading world: {world_path}")
+    level = amulet.load_level(world_path)
 
-# ---------------------------
-# REAL translator for Amulet 1.9.32
-# ---------------------------
-platform = level.level_wrapper.platform
-version = level.level_wrapper.version  # MUST be tuple in this version
+    platform = level.level_wrapper.platform
+    version = level.level_wrapper.version
+    print(f"INFO - Platform: {platform}, Version: {version}")
 
-print("INFO - Platform =", platform)
-print("INFO - Version  =", version)
+    translator = level.translation_manager.get_version(platform, version)
+    block_translator = translator.block
+    biome_translator = translator.biome
 
-translator = level.translation_manager.get_version(platform, version)
-block_translator = translator.block
+    chunk_data = []
+    all_blocks = set()
 
+    coords = list(spiral_chunks(max_radius))
+    print(f"INFO - Total chunks to process: {len(coords)}")
 
-# ------------------------------------------
-# Scan
-# ------------------------------------------
-chunk_data = []
-all_blocks = set()
+    # Iterate chunks with progress bar
+    for chunk_x, chunk_z in tqdm(coords, desc="Processing chunks", ncols=100):
+        try:
+            chunk = level.get_chunk(chunk_x, chunk_z, dimension)
+        except (ChunkDoesNotExist, ChunkLoadError):
+            continue
 
-MAX_RADIUS = 10
+        block_counter = Counter()
+        biome_counter = Counter()
+        subchunks = sorted(chunk.blocks.sub_chunks)
 
-for chunk_x, chunk_z in spiral_chunks(MAX_RADIUS):
+        if not subchunks:
+            block_counter["minecraft:air"] = 16*16*384
+            dominant_biome = "unknown"
+        else:
+            for sy in range(min(subchunks), max(subchunks)+1):
+                if sy in chunk.blocks.sub_chunks:
+                    arr = chunk.blocks.get_sub_chunk(sy)
+                else:
+                    arr = np.zeros((16,16,16), dtype=int)
+                palette = chunk.block_palette
 
-    try:
-        chunk = level.get_chunk(chunk_x, chunk_z, dimension)
-    except (ChunkDoesNotExist, ChunkLoadError):
-        print(f"✘ Missing chunk {chunk_x},{chunk_z}")
-        continue
+                # ---------- PRE-TRANSLATION ----------
+                translated_palette = {i: safe_block_name(b, block_translator) for i, b in enumerate(palette)}
 
-    print(f"✔ Chunk {chunk_x},{chunk_z}")
+                # ---------- VECTORIZE COUNT ----------
+                flat_arr = arr.flatten()
+                unique, counts = np.unique(flat_arr, return_counts=True)
+                for idx, cnt in zip(unique, counts):
+                    name = translated_palette[idx]
+                    block_counter[name] += cnt
+                    all_blocks.add(name)
 
-    block_counter = Counter()
-    biome_counter = Counter()
+                # ---------- BIOMES ----------
+                if chunk.biomes.has_section(sy):
+                    biome_arr = chunk.biomes.get_section(sy)
+                    biome_palette = chunk.biome_palette
+                    # pre-translate biome palette
+                    translated_biome_palette = {i: safe_biome_name(b, biome_translator) for i, b in enumerate(biome_palette)}
 
-    subchunks = sorted(chunk.blocks.sub_chunks)
+                    flat_biome = biome_arr.flatten()
+                    unique_b, counts_b = np.unique(flat_biome, return_counts=True)
+                    for idx, cnt in zip(unique_b, counts_b):
+                        name = translated_biome_palette[idx]
+                        biome_counter[name] += cnt
 
-    if not subchunks:
-        block_counter["minecraft:air"] = 16 * 16 * 384
-        dominant_biome = "unknown"
+            dominant_biome = biome_counter.most_common(1)[0][0] if biome_counter else "unknown"
 
-    else:
-        for section_y in range(min(subchunks), max(subchunks) + 1):
+        chunk_data.append({
+            "x": chunk_x,
+            "z": chunk_z,
+            "biome": dominant_biome,
+            "blocks": block_counter
+        })
 
-            # ---------- blocks ----------
-            if section_y in chunk.blocks.sub_chunks:
-                arr = chunk.blocks.get_sub_chunk(section_y)
-            else:
-                arr = np.zeros((16, 16, 16), dtype=int)
+    level.close()
 
-            palette = chunk.block_palette
+    # Write CSV
+    all_blocks = sorted(all_blocks)
+    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        header = ["chunk_x", "chunk_z", "dominant_biome"] + all_blocks
+        writer.writerow(header)
+        for entry in chunk_data:
+            row = [entry["x"], entry["z"], entry["biome"]] + [entry["blocks"].get(b,0) for b in all_blocks]
+            writer.writerow(row)
 
-            for x in range(16):
-                for y in range(16):
-                    for z in range(16):
-                        idx = arr[x, y, z]
-                        universal_block = palette[idx]
-
-                        # translate universal → real
-                        real_block = block_translator.from_universal(universal_block)
-
-                        # If translator gives tuple → take first
-                        if isinstance(real_block, tuple):
-                            real_block = real_block[0]
-
-                        if real_block is None:
-                            name = universal_block.namespaced_name
-                        else:
-                            name = real_block.namespaced_name
-
-                        block_counter[name] += 1
-                        all_blocks.add(name)
-
-            # ---------- biomes ----------
-            # dans ta boucle sur les subchunks
-            if chunk.biomes.has_section(section_y):
-                biome_arr = chunk.biomes.get_section(section_y)
-                for bx in range(biome_arr.shape[0]):
-                    for by in range(biome_arr.shape[1]):
-                        for bz in range(biome_arr.shape[2]):
-                            idx = biome_arr[bx, by, bz]
-                            universal_biome = chunk.biome_palette[idx]
-
-                            # ✅ traduction correcte
-                            real_biome = translator.biome.from_universal(universal_biome)
-
-                            # certains renvoient tuple → prendre premier
-                            if isinstance(real_biome, tuple):
-                                real_biome = real_biome[0]
-
-                            # fallback
-                            if real_biome is None:
-                                name = getattr(universal_biome, "namespaced_name", str(universal_biome))
-                            else:
-                                name = getattr(real_biome, "namespaced_name", str(real_biome))
-
-                            biome_counter[name] += 1
-
-        dominant_biome = biome_counter.most_common(1)[0][0] if biome_counter else "unknown"
-
-
-    chunk_data.append({
-        "x": chunk_x,
-        "z": chunk_z,
-        "biome": dominant_biome,
-        "blocks": block_counter
-    })
-
+    print(f"✔ DONE — CSV written: {output_csv}")
 
 # ---------------------------
-# Write CSV
+# CLI
 # ---------------------------
-output_csv = "chunks_save.csv"
-all_blocks = sorted(all_blocks)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Minecraft chunk CSV exporter (fast mono-process)")
+    parser.add_argument("world", help="Path to Minecraft world folder")
+    parser.add_argument("-o", "--output", default="chunks_biomes.csv", help="Output CSV filename")
+    parser.add_argument("-r", "--radius", type=int, default=10, help="Radius of chunks to process (spiral)")
+    args = parser.parse_args()
 
-with open(output_csv, "w", newline="", encoding="utf-8") as f:
-    writer = csv.writer(f)
-
-    header = ["chunk_x", "chunk_z", "dominant_biome"] + all_blocks
-    writer.writerow(header)
-
-    for entry in chunk_data:
-        row = [entry["x"], entry["z"], entry["biome"]]
-        for b in all_blocks:
-            row.append(entry["blocks"].get(b, 0))
-        writer.writerow(row)
-
-level.close()
-
-print("✔ DONE — CSV written:", output_csv)
+    main(args.world, args.output, args.radius)
