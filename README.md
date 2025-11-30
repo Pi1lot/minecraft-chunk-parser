@@ -21,11 +21,7 @@ This project uses the [Amulet world manipulation](https://www.amuletmc.com/) lib
 pip install amulet-core numpy tqdm
 ```
 
-## Usage Example (CLI)
-
-python3 chunk_parser.py /path/to/minecraft/world -o output.csv -r 20
-
-### Arguments
+### CLI usage
 
 | Flag            | Description                          |
 |-----------------|--------------------------------------|
